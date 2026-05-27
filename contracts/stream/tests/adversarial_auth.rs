@@ -857,7 +857,10 @@ fn test_recipient_update_propose_and_accept_flow() {
     ctx.client().update_recipient(&stream_id, &new_recipient);
 
     // Verify pending update exists
-    let pending = ctx.client().get_pending_recipient_update(&stream_id).unwrap();
+    let pending = ctx
+        .client()
+        .get_pending_recipient_update(&stream_id)
+        .unwrap();
     assert_eq!(pending.proposed_recipient, new_recipient);
 
     // 2. Accept (Current Recipient)
@@ -875,7 +878,10 @@ fn test_recipient_update_propose_and_accept_flow() {
     // Verify update applied
     let state = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state.recipient, new_recipient);
-    assert!(ctx.client().get_pending_recipient_update(&stream_id).is_none());
+    assert!(ctx
+        .client()
+        .get_pending_recipient_update(&stream_id)
+        .is_none());
 }
 
 #[test]
@@ -909,7 +915,10 @@ fn test_recipient_update_cancel_by_sender() {
     ctx.client().cancel_recipient_update(&stream_id);
 
     // Verify cancelled
-    assert!(ctx.client().get_pending_recipient_update(&stream_id).is_none());
+    assert!(ctx
+        .client()
+        .get_pending_recipient_update(&stream_id)
+        .is_none());
     let state = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state.recipient, ctx.recipient);
 }

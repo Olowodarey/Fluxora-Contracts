@@ -543,9 +543,11 @@ contract.create_streams_relative(&sender, &params)?;
 | `get_stream_state`        | Anyone                        | None (view)                                 |
 | `get_streams_by_id_range` | Anyone                        | None (view, paginated)                      |
 | `get_recipient_streams_paginated` | Anyone                  | None (view, paginated)                      |
+| `get_pending_recipient_update` | Anyone                     | None (view)                                 |
 | `pause_stream_as_admin`   | Admin                         | `admin.require_auth()`                      |
 | `resume_stream_as_admin`  | Admin                         | `admin.require_auth()`                      |
 | `cancel_stream_as_admin`  | Admin                         | `admin.require_auth()`                      |
+| `migrate_recipient_index` | Admin                         | `admin.require_auth()`                      |
 | `close_completed_stream`  | Anyone                        | None (permissionless terminal cleanup)     |
 | `top_up_stream`           | Funder address                | `funder.require_auth()`                     |
 | `update_rate_per_second`  | Sender                        | `sender.require_auth()`                     |
@@ -630,6 +632,10 @@ loop {
 | `get_recipient_streams_paginated` | Large portfolios | 100/page | Bounded, safe |
 | `get_streams_by_id_range` | Full contract export | 100/page | Bounded, safe |
 
+#### Recipient Index Migration (#519)
+
+Administrators can migrate a recipient's legacy flat stream list to a segmented paged index via `migrate_recipient_index(recipient)`. This bounds per-operation I/O at $O(1)$ and is recommended for high-volume recipients to prevent memory exhaustion during mutations.
+
 ### top_up_stream: Observable Semantics
 
 `top_up_stream(stream_id, funder, amount)` is a deposit-only mutation for existing streams.
@@ -702,6 +708,10 @@ From **CONTRACT_VERSION 6**, the stream recipient is rotated via a two-step prop
 - Only the current recipient can accept an update.
 - If a proposal is already pending, `update_recipient` fails with `PendingRecipientUpdateExists`.
 - Attempting to accept or cancel when no proposal exists returns `NoPendingRecipientUpdate`.
+
+#### `get_pending_recipient_update(stream_id) -> Option<PendingRecipientUpdate>`
+
+View function to check if a recipient rotation is currently proposed for a stream. Returns the proposed recipient address and timestamp if pending.
 
 ### transfer_sender: Observable Semantics
 

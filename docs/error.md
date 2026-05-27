@@ -32,6 +32,8 @@ treasury tooling) can use this reference to handle protocol exceptions correctly
 | `SignatureDeadlineExpired` | 18 | Delegated-withdrawal signature deadline has passed | `delegated_withdraw_to` |
 | `InvalidSignature` | 19 | Delegated-withdrawal signature does not verify against the recipient's key | `delegated_withdraw_to` |
 | `InvalidDustThreshold` | 20 | `withdraw_dust_threshold` exceeds `deposit_amount` | `create_stream`, `create_streams`, `create_stream_from_template`, and relative variants |
+| `NoPendingRecipientUpdate` | 21 | No recipient update proposal exists for the given stream | `accept_recipient_update`, `cancel_recipient_update` |
+| `PendingRecipientUpdateExists` | 22 | A recipient update proposal is already pending for this stream | `update_recipient` |
 
 ---
 
@@ -676,6 +678,47 @@ match client.try_delete_stream_template(&template_id) {
 - Usually, dust threshold is a small fraction of the deposit.
 
 **Success Semantics**: Returns `u64` stream_id.
+
+---
+
+### NoPendingRecipientUpdate (21)
+
+**Definition**: No recipient update proposal exists for the given stream ID.
+
+**Trigger Conditions**:
+- `accept_recipient_update` or `cancel_recipient_update` called when no proposal is pending in storage.
+
+**Affected Roles**:
+| Role | Can Trigger | Notes |
+|------|------------|-------|
+| Recipient | Yes | If they try to accept a proposal that doesn't exist or was already cancelled |
+| Sender | Yes | If they try to cancel a proposal that doesn't exist |
+
+**Client Action**:
+- Confirm the stream ID.
+- Check `get_pending_recipient_update` to verify if a proposal exists.
+
+**Success Semantics**: Returns `()`.
+
+---
+
+### PendingRecipientUpdateExists (22)
+
+**Definition**: A recipient update proposal is already pending for this stream.
+
+**Trigger Conditions**:
+- `update_recipient` called when a proposal already exists for the stream.
+
+**Affected Roles**:
+| Role | Can Trigger | Notes |
+|------|------------|-------|
+| Sender | Yes | If they try to propose a second rotation before the first is accepted/cancelled |
+
+**Client Action**:
+- Wait for the current recipient to accept.
+- Or call `cancel_recipient_update` first to clear the pending proposal.
+
+**Success Semantics**: Returns `()`.
 
 ---
 
