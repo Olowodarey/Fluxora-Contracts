@@ -428,7 +428,23 @@ pub struct PauseInfo {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Stream {
+pub struct PauseRecord {
+    pub actor: Address,
+    pub timestamp: u64,
+    pub reason: soroban_sdk::String,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PauseKind {
+    GlobalEmergency = 0,
+    Protocol = 1,
+    Stream = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Stream {
     pub stream_id: u64,
     pub sender: Address,
     pub recipient: Address,
@@ -611,8 +627,15 @@ pub enum DataKey {
     OwnerTemplateIds(Address),
     /// Sum of outstanding deposit liabilities (`i128`, instance storage).
     TotalLiabilities,
-    /// Maximum rate per second allowed by governance (`i128`, instance storage).
-    MaxRatePerSecond,
+    /// Per-recipient nonce counter for delegated-withdraw replay protection.
+    /// Appended last to preserve existing discriminant values.
+    WithdrawNonce(Address),
+    /// Current protocol-wide pause state (Active, CreationPaused, or GlobalEmergencyPaused).
+    PauseState,
+    /// Reentrancy guard flag (bool) to prevent recursive token transfers.
+    ReentrancyLock,
+    /// Last pause audit record per kind.
+    LastPauseRecord(PauseKind),
 }
 
 // ---------------------------------------------------------------------------
@@ -4198,7 +4221,8 @@ impl FluxoraStream {
         stream_id: u64,
         reason: PauseReason,
     ) -> Result<(), ContractError> {
-        get_admin(&env)?.require_auth();
+        let admin = get_admin(&env)?;
+        admin.require_auth();
 
         let mut stream = load_stream(&env, stream_id)?;
 
@@ -4214,6 +4238,19 @@ impl FluxoraStream {
 
         stream.status = StreamStatus::Paused;
         save_stream(&env, &stream);
+
+        let reason_str = match reason {
+            PauseReason::Operational => soroban_sdk::String::from_str(&env, "Operational"),
+            PauseReason::Administrative => soroban_sdk::String::from_str(&env, "Administrative"),
+        };
+        let record = PauseRecord {
+            actor: admin,
+            timestamp: env.ledger().timestamp(),
+            reason: reason_str,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::LastPauseRecord(PauseKind::Stream), &record);
 
         env.events().publish(
             (symbol_short!("paused"), stream_id),
@@ -4285,9 +4322,22 @@ impl FluxoraStream {
         let admin = get_admin(&env).unwrap();
         admin.require_auth();
 
-        env.storage()
-            .instance()
-            .set(&DataKey::GlobalEmergencyPaused, &paused);
+        let state = if paused {
+            let record = PauseRecord {
+                actor: admin.clone(),
+                timestamp: env.ledger().timestamp(),
+                reason: soroban_sdk::String::from_str(&env, "Global emergency pause"),
+            };
+            env.storage()
+                .instance()
+                .set(&DataKey::LastPauseRecord(PauseKind::GlobalEmergency), &record);
+
+            PauseState::GlobalEmergencyPaused
+        } else {
+            PauseState::Active
+        };
+
+        env.storage().instance().set(&DataKey::PauseState, &state);
         bump_instance_ttl(&env);
 
         env.events().publish(
@@ -4434,6 +4484,15 @@ impl FluxoraStream {
             .instance()
             .set(&DataKey::GlobalPauseAdmin, &admin);
 
+        let record = PauseRecord {
+            actor: admin.clone(),
+            timestamp: now,
+            reason: reason_str.clone(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::LastPauseRecord(PauseKind::Protocol), &record);
+
         bump_instance_ttl(&env);
 
         // Emit ProtocolPaused event AFTER storage is written
@@ -4541,104 +4600,24 @@ impl FluxoraStream {
         }
     }
 
-    /// Sweep excess tokens from the contract to a specified recipient.
+    /// Retrieve the last pause record for a specific pause kind.
     ///
-    /// When streams are cancelled or the deposit sum exceeds cumulative accrual
-    /// (e.g., due to rate decreases via `decrease_rate_per_second`), residual USDC
-    /// can become trapped in the contract. This function allows the admin to recover
-    /// those excess tokens by calculating the difference between the contract's token
-    /// balance and the sum of all outstanding obligations (tracked liabilities).
+    /// Provides an on-chain audit trail of who triggered the last pause of a given kind,
+    /// when it happened, and the reason provided.
     ///
     /// # Parameters
-    /// - `recipient`: Address to receive the excess tokens
+    /// - `kind`: The type of pause to query (GlobalEmergency, Protocol, or Stream).
     ///
     /// # Authorization
-    /// - Requires authorization from the contract admin
+    /// - None required (read-only query).
     ///
     /// # Returns
-    /// - `i128`: Amount of excess tokens swept (0 if no excess exists)
-    ///
-    /// # Errors
-    /// - `ContractError::InvalidState`: If contract is not initialized
-    /// - `ContractError::Unauthorized`: If caller is not the admin
-    /// - `ContractError::InvalidParams`: If recipient address is invalid
-    ///
-    /// # Events
-    /// - Publishes `ExcessSwept { to, amount }` event on success
-    ///
-    /// # Security
-    /// - Only callable by admin to prevent unauthorized fund extraction
-    /// - Uses tracked liabilities (`TotalLiabilities`) to ensure recipient funds are protected
-    /// - CEI pattern: calculates excess, updates state, then transfers tokens
-    /// - Reentrancy protected via `acquire_reentrancy_lock`
-    ///
-    /// # Calculation
-    /// ```text
-    /// excess = contract_token_balance - total_liabilities
-    /// ```
-    ///
-    /// Where `total_liabilities` is the sum of all active stream deposits that haven't
-    /// been withdrawn or refunded yet.
-    ///
-    /// # Usage Notes
-    /// - Safe to call even when no excess exists (returns 0, no transfer)
-    /// - Does not affect active streams or recipient entitlements
-    /// - Useful for recovering funds after mass cancellations or rate decreases
-    /// - Should be called periodically by operators to maintain clean accounting
-    ///
-    /// # Example Scenarios
-    /// 1. Stream cancelled at 50% completion → 50% refunded to sender, but if sender
-    ///    address is lost, those tokens become excess
-    /// 2. Rate decreased from 100/s to 50/s → excess deposit refunded, but if refund
-    ///    fails, tokens remain in contract
-    /// 3. Rounding errors accumulate over many streams → small excess builds up
-    pub fn sweep_excess(env: Env, recipient: Address) -> Result<i128, ContractError> {
-        // Only admin can sweep excess tokens
-        let admin = get_admin(&env)?;
-        admin.require_auth();
-
-        // Validate recipient address
-        recipient.require_valid();
-
-        // Get contract's token balance
-        let token_address = get_token(&env)?;
-        let token_client = token::Client::new(&env, &token_address);
-        let contract_balance = token_client.balance(&env.current_contract_address());
-
-        // Get total outstanding liabilities (sum of all active stream deposits)
-        let total_liabilities = read_total_liabilities(&env);
-
-        // Calculate excess: balance - liabilities
-        // If liabilities exceed balance, there's no excess (should not happen in normal operation)
-        let excess = contract_balance.saturating_sub(total_liabilities);
-
-        // If no excess, return early (no transfer needed)
-        if excess <= 0 {
-            return Ok(0);
-        }
-
-        // CEI pattern: Emit event before transfer
-        env.events().publish(
-            (symbol_short!("ex_swept"), recipient.clone()),
-            ExcessSwept {
-                to: recipient.clone(),
-                amount: excess,
-            },
-        );
-
-        // Acquire reentrancy lock before token transfer
-        acquire_reentrancy_lock(&env)?;
-
-        // Transfer excess tokens to recipient
-        let transfer_result = push_token(&env, &recipient, excess);
-
-        // Release reentrancy lock
-        release_reentrancy_lock(&env);
-
-        // Propagate any transfer errors
-        transfer_result?;
-
-        Ok(excess)
+    /// - `Some(PauseRecord)` if a pause of the specified kind has occurred.
+    /// - `None` if no pause of that kind has ever been recorded.
+    pub fn get_last_pause_record(env: Env, kind: PauseKind) -> Option<PauseRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::LastPauseRecord(kind))
     }
 }
 
