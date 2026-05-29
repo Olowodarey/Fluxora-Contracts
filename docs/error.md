@@ -31,6 +31,11 @@ treasury tooling) can use this reference to handle protocol exceptions correctly
 | `TemplateUnauthorized` | 17 | Caller is not the template owner | `delete_stream_template` |
 | `RateCapExceeded` | 18 | Rate exceeds the governance-controlled maximum rate per second | `create_stream`, `create_streams`, `create_stream_relative`, `update_rate_per_second` |
 
+| `InvalidSignature` | 15 | Delegated withdrawal signature is invalid, expired, or nonce mismatch | `delegated_withdraw` |
+| `BelowMinimumAmount` | 16 | Withdrawable amount is below the `expected_minimum_amount` committed in the signature | `delegated_withdraw` |
+| `InvalidAutoClaimDestination` | 17 | Auto-claim destination is the zero address | `set_auto_claim` |
+| `PauseReasonTooLong` | 18 | Pause reason string exceeds `MAX_PAUSE_REASON_BYTES` (256 bytes) | `pause_protocol` |
+
 ---
 
 ## Detailed Error Semantics
