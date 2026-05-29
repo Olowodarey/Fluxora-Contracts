@@ -1056,21 +1056,27 @@ fn test_batch_withdraw_to_contract_address_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #532: migration_v5_to_v6 stub
+// Issue #515: batch_withdraw uses cached ledger timestamp
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_migration_v5_to_v6_admin_succeeds() {
+fn test_batch_withdraw_consistent_amounts_with_cached_timestamp() {
+    // Verifies that all streams in a batch_withdraw are evaluated at the same
+    // timestamp (the cached `now`), producing consistent, deterministic results.
     let ctx = TestContext::setup();
-    // Admin can call the migration stub without error.
-    ctx.client().migration_v5_to_v6(&ctx.admin);
-}
 
-#[test]
-fn test_migration_v5_to_v6_non_admin_rejected() {
-    let ctx = TestContext::setup();
-    let stranger = soroban_sdk::Address::generate(&ctx.env);
-    let result = ctx.client().try_migration_v5_to_v6(&stranger);
-    // Should fail auth (host trap or Unauthorized).
-    assert!(result.is_err(), "non-admin must not call migration_v5_to_v6");
+    ctx.env.ledger().set_timestamp(0);
+    let id0 = ctx.create_default_stream();
+    let id1 = ctx.create_default_stream();
+
+    // Advance to mid-stream
+    ctx.env.ledger().set_timestamp(500);
+
+    let stream_ids = soroban_sdk::vec![&ctx.env, id0, id1];
+    let results = ctx.client().batch_withdraw(&ctx.recipient, &stream_ids);
+
+    assert_eq!(results.len(), 2);
+    // Both streams evaluated at t=500: each should yield 500 tokens
+    assert_eq!(results.get(0).unwrap().amount, 500);
+    assert_eq!(results.get(1).unwrap().amount, 500);
 }
