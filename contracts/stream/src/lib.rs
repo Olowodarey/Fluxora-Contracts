@@ -30,20 +30,17 @@ const PERSISTENT_BUMP_AMOUNT: u32 = 120_960;
 /// All paginated entrypoints enforce this limit strictly.
 pub const MAX_PAGE_SIZE: u64 = 100;
 
-/// Maximum memo payload size in bytes (stream metadata for indexers).
-pub const MAX_MEMO_BYTES: usize = 64;
-
-/// Maximum schedule templates a single owner may register (bounds `OwnerTemplateIds` growth).
-pub const MAX_TEMPLATES_PER_OWNER: u32 = 64;
-/// Global bound on stored schedule templates (DoS / storage bloat prevention).
-pub const MAX_GLOBAL_TEMPLATES: u64 = 10_000;
-
-/// Maximum rotation history entries per stream (ring-buffer semantics).
-/// Prevents unbounded storage growth while maintaining compliance audit trail.
-pub const MAX_ROTATION_HISTORY: u32 = 256;
-
-/// Maximum memo payload size in bytes (stream metadata for indexers).
-pub const MAX_MEMO_BYTES: usize = 64;
+/// Minimum ledger interval between withdrawals (anti-spam).
+///
+/// Enforces a minimum gap of ledgers between consecutive withdrawals on the same stream
+/// to prevent excessive ledger entry generation and I/O costs from high-frequency polling.
+/// Approximately 1 minute at ~5 seconds per ledger close (subject to network conditions).
+///
+/// This is a fixed constant in the current implementation. Future versions may support
+/// per-stream or governance-controlled configurability.
+///
+/// TODO: Consider making this configurable per-stream or via governance in a future version.
+pub const MIN_WITHDRAW_INTERVAL_LEDGERS: u32 = 17;
 
 /// Maximum byte length for pause-reason strings passed to `pause_stream`,
 /// `pause_stream_as_admin`, and `pause_protocol`.
@@ -315,14 +312,8 @@ pub enum ContractError {
     InvalidSignature = 15,
     /// Accrued amount is below the expected minimum specified in the signed payload.
     BelowMinimumAmount = 16,
-    /// Template owner has reached the per-address template cap.
-    TemplateLimitExceeded = 17,
-    /// The requested stream template does not exist.
-    TemplateNotFound = 18,
-    /// Pause reason string exceeds MAX_PAUSE_REASON_BYTES.
-    PauseReasonTooLong = 19,
-    /// Keeper called keeper_cancel before the grace period elapsed past end_time.
-    KeeperGracePeriodNotElapsed = 20,
+    /// Withdrawal attempted before minimum ledger interval has elapsed.
+    WithdrawalTooFrequent = 17,
 }
 
 #[contracttype]
@@ -691,6 +682,15 @@ pub struct Stream {
     /// Optional bounded memo for indexer correlation (e.g. payroll batch ID).
     /// Maximum length: `MAX_MEMO_BYTES` (64 bytes). `None` when not supplied.
     pub memo: Option<soroban_sdk::Bytes>,
+    /// Ledger sequence number of the last successful withdrawal.
+    ///
+    /// Enforces `MIN_WITHDRAW_INTERVAL_LEDGERS` between consecutive withdrawals to prevent
+    /// excessive ledger entry generation and I/O costs from high-frequency polling.
+    /// Initialized to 0 at stream creation (first withdrawal always succeeds).
+    /// Updated to `env.ledger().sequence()` after each successful withdrawal.
+    ///
+    /// Invariant: `last_withdraw_ledger <= current_ledger_sequence` (monotonic ledger progression).
+    pub last_withdraw_ledger: u32,
 }
 
 
@@ -1493,7 +1493,7 @@ impl FluxoraStream {
             checkpointed_at: start_time,
             withdraw_dust_threshold,
             memo: memo.clone(),
-            metadata: metadata.clone(),
+            last_withdraw_ledger: 0,
         };
 
         save_stream(env, &stream);
@@ -1520,7 +1520,80 @@ impl FluxoraStream {
                 end_time,
                 withdraw_dust_threshold,
                 memo,
-                metadata,
+            },
+        );
+
+        Ok(stream_id)
+    }
+
+    /// Like `persist_new_stream` but skips the per-call recipient index update.
+    ///
+    /// Used by `create_streams` to batch index writes: the caller collects all
+    /// (recipient → stream_ids) pairs and flushes them once per unique recipient,
+    /// reducing ledger I/O from O(n) to O(1) per recipient.
+    #[allow(clippy::too_many_arguments)]
+    fn persist_new_stream_skip_index(
+        env: &Env,
+        sender: Address,
+        recipient: Address,
+        deposit_amount: i128,
+        rate_per_second: i128,
+        start_time: u64,
+        cliff_time: u64,
+        end_time: u64,
+        withdraw_dust_threshold: i128,
+        memo: Option<soroban_sdk::Bytes>,
+    ) -> Result<u64, ContractError> {
+        if let Some(ref m) = memo {
+            if m.len() as usize > MAX_MEMO_BYTES {
+                return Err(ContractError::InvalidParams);
+            }
+        }
+
+        let stream_id = read_stream_count(env);
+        set_stream_count(env, stream_id + 1);
+
+        let stream = Stream {
+            stream_id,
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            deposit_amount,
+            rate_per_second,
+            start_time,
+            cliff_time,
+            end_time,
+            withdrawn_amount: 0,
+            status: StreamStatus::Active,
+            cancelled_at: None,
+            checkpointed_amount: 0,
+            checkpointed_at: start_time,
+            withdraw_dust_threshold,
+            memo: memo.clone(),
+            last_withdraw_ledger: 0,
+        };
+
+        save_stream(env, &stream);
+
+        // Index update is intentionally skipped here; caller must flush the cache.
+
+        let liabilities = read_total_liabilities(env)
+            .checked_add(deposit_amount)
+            .unwrap_or(i128::MAX);
+        write_total_liabilities(env, liabilities);
+
+        env.events().publish(
+            (symbol_short!("created"), stream_id),
+            StreamCreated {
+                stream_id,
+                sender,
+                recipient,
+                deposit_amount,
+                rate_per_second,
+                start_time,
+                cliff_time,
+                end_time,
+                withdraw_dust_threshold,
+                memo,
             },
         );
 
@@ -2455,6 +2528,14 @@ impl FluxoraStream {
         // Enforce recipient-only authorization
         stream.recipient.require_auth();
 
+        // Enforce withdrawal frequency limit to prevent excessive ledger I/O.
+        // Invariant: current_ledger >= last_withdraw_ledger (monotonic ledger progression).
+        // First withdrawal (last_withdraw_ledger == 0) always succeeds.
+        let current_ledger = env.ledger().sequence();
+        if current_ledger - stream.last_withdraw_ledger < MIN_WITHDRAW_INTERVAL_LEDGERS {
+            return Err(ContractError::WithdrawalTooFrequent);
+        }
+
         if stream.status == StreamStatus::Completed {
             return Err(ContractError::InvalidState);
         }
@@ -2495,6 +2576,7 @@ impl FluxoraStream {
         // CEI: update state before external token transfer to reduce reentrancy risk.
         // Assumption: the token contract does not reenter this contract.
         stream.withdrawn_amount += withdrawable;
+        stream.last_withdraw_ledger = current_ledger; // Update withdrawal timestamp
         let completed_now = (stream.status == StreamStatus::Active
             || stream.status == StreamStatus::Paused)
             && stream.withdrawn_amount == stream.deposit_amount;
@@ -2797,11 +2879,23 @@ impl FluxoraStream {
             token::Client::new(&env, &token_address).balance(&env.current_contract_address());
         let mut results = soroban_sdk::Vec::new(&env);
 
+        // Cache ledger timestamp once — it is constant within a single transaction.
+        // Avoids a redundant host-function call on every loop iteration (#515).
+        let now = env.ledger().timestamp();
+        let current_ledger = env.ledger().sequence();
+
         for stream_id in stream_ids.iter() {
             let mut stream = load_stream(&env, stream_id)?;
 
             if stream.recipient != recipient {
                 return Err(ContractError::Unauthorized);
+            }
+
+            // Enforce withdrawal frequency limit per stream in the batch.
+            // Each stream must respect its own last_withdraw_ledger independently.
+            // Invariant: current_ledger >= last_withdraw_ledger (monotonic ledger progression).
+            if current_ledger - stream.last_withdraw_ledger < MIN_WITHDRAW_INTERVAL_LEDGERS {
+                return Err(ContractError::WithdrawalTooFrequent);
             }
 
             if stream.status == StreamStatus::Paused && !is_terminal_state(&env, &stream) {
@@ -2832,6 +2926,7 @@ impl FluxoraStream {
                 contract_balance -= withdrawable;
 
                 stream.withdrawn_amount += withdrawable;
+                stream.last_withdraw_ledger = current_ledger; // Update withdrawal timestamp
                 let completed_now = (stream.status == StreamStatus::Active
                     || stream.status == StreamStatus::Paused)
                     && stream.withdrawn_amount == stream.deposit_amount;
@@ -2992,6 +3087,163 @@ impl FluxoraStream {
         }
 
         Ok(results)
+    }
+
+    /// Withdraw accrued tokens on behalf of a recipient using an ed25519 signature.
+    ///
+    /// A relayer (keeper, bot, or any third party) may call this entrypoint to
+    /// trigger a withdrawal without requiring the recipient to submit a transaction
+    /// themselves. The recipient signs a message committing to:
+    ///
+    /// ```text
+    /// message = stream_id (u64, big-endian)
+    ///         | nonce     (u64, big-endian)
+    ///         | deadline  (u64, big-endian)
+    ///         | expected_minimum_amount (i128, big-endian)
+    /// ```
+    ///
+    /// The `expected_minimum_amount` field closes the relayer front-running griefing
+    /// vector: a relayer cannot delay the transaction until the accrued amount is
+    /// smaller than the recipient expected, because the call will revert with
+    /// `BelowMinimumAmount` if `withdrawable < expected_minimum_amount`.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Stream to withdraw from.
+    /// - `relayer`: Address submitting the transaction (pays fees; no special privilege).
+    /// - `recipient_public_key`: Raw 32-byte ed25519 public key of the recipient.
+    /// - `nonce`: Replay-protection counter; must equal the stored nonce for this recipient.
+    /// - `deadline`: Ledger timestamp after which the signature is rejected.
+    /// - `expected_minimum_amount`: Minimum withdrawable amount the recipient accepts.
+    ///   Pass `0` to accept any positive amount.
+    /// - `signature`: 64-byte ed25519 signature over the message above.
+    ///
+    /// # Returns
+    /// - `i128`: Amount transferred to the recipient.
+    ///
+    /// # Errors
+    /// - `InvalidSignature` (15): Signature verification failed, deadline passed, or nonce mismatch.
+    /// - `BelowMinimumAmount` (16): Withdrawable amount is below `expected_minimum_amount`.
+    /// - `InvalidState`: Stream is paused (non-terminal) or completed.
+    /// - `StreamNotFound`: `stream_id` does not exist.
+    pub fn delegated_withdraw(
+        env: Env,
+        stream_id: u64,
+        relayer: Address,
+        recipient_public_key: soroban_sdk::Bytes,
+        nonce: u64,
+        deadline: u64,
+        expected_minimum_amount: i128,
+        signature: soroban_sdk::Bytes,
+    ) -> Result<i128, ContractError> {
+        require_not_globally_paused(&env)?;
+
+        // The relayer authorizes the transaction (pays fees); recipient auth is
+        // replaced by the ed25519 signature check below.
+        relayer.require_auth();
+
+        // 1. Deadline check — reject stale signatures.
+        if env.ledger().timestamp() > deadline {
+            return Err(ContractError::InvalidSignature);
+        }
+
+        // 2. Load stream.
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // 3. Enforce withdrawal frequency limit to prevent excessive ledger I/O.
+        // Invariant: current_ledger >= last_withdraw_ledger (monotonic ledger progression).
+        // First withdrawal (last_withdraw_ledger == 0) always succeeds.
+        let current_ledger = env.ledger().sequence();
+        if current_ledger - stream.last_withdraw_ledger < MIN_WITHDRAW_INTERVAL_LEDGERS {
+            return Err(ContractError::WithdrawalTooFrequent);
+        }
+
+        // 4. Nonce check — replay protection.
+        let stored_nonce = load_delegated_nonce(&env, &stream.recipient);
+        if nonce != stored_nonce {
+            return Err(ContractError::InvalidSignature);
+        }
+
+        // 5. Build the signed message:
+        //    stream_id (8 bytes) | nonce (8 bytes) | deadline (8 bytes) | expected_minimum_amount (16 bytes)
+        let mut msg = soroban_sdk::Bytes::new(&env);
+        msg.extend_from_array(&stream_id.to_be_bytes());
+        msg.extend_from_array(&nonce.to_be_bytes());
+        msg.extend_from_array(&deadline.to_be_bytes());
+        msg.extend_from_array(&expected_minimum_amount.to_be_bytes());
+
+        // 6. Verify ed25519 signature — panics on failure (Soroban host trap).
+        env.crypto()
+            .ed25519_verify(&recipient_public_key, &msg, &signature);
+
+        // 7. State checks (same as withdraw).
+        if stream.status == StreamStatus::Completed {
+            return Err(ContractError::InvalidState);
+        }
+        if stream.status == StreamStatus::Paused && !is_terminal_state(&env, &stream) {
+            return Err(ContractError::InvalidState);
+        }
+
+        // 7. Compute withdrawable amount.
+        let accrued = Self::calculate_accrued(env.clone(), stream_id)?;
+        let mut withdrawable = accrued - stream.withdrawn_amount;
+
+        // Cap by contract balance for safety.
+        let token_address = get_token(&env)?;
+        let contract_balance =
+            token::Client::new(&env, &token_address).balance(&env.current_contract_address());
+        withdrawable = withdrawable.min(contract_balance);
+
+        // 8. Enforce minimum amount guard — closes the front-running griefing vector.
+        if withdrawable < expected_minimum_amount {
+            return Err(ContractError::BelowMinimumAmount);
+        }
+
+        if withdrawable <= 0 {
+            return Ok(0);
+        }
+
+        // 9. CEI: update state before external token transfer.
+        stream.withdrawn_amount += withdrawable;
+        stream.last_withdraw_ledger = current_ledger; // Update withdrawal timestamp
+        let completed_now = (stream.status == StreamStatus::Active
+            || stream.status == StreamStatus::Paused)
+            && stream.withdrawn_amount == stream.deposit_amount;
+        if completed_now {
+            stream.status = StreamStatus::Completed;
+        }
+        save_stream(&env, &stream);
+
+        // 10. Increment nonce to prevent replay.
+        increment_delegated_nonce(&env, &stream.recipient);
+
+        // 11. Transfer tokens to recipient.
+        push_token(&env, &stream.recipient, withdrawable)?;
+
+        env.events().publish(
+            (symbol_short!("withdrew"), stream_id),
+            Withdrawal {
+                stream_id,
+                recipient: stream.recipient.clone(),
+                amount: withdrawable,
+            },
+        );
+
+        if completed_now {
+            env.events().publish(
+                (symbol_short!("completed"), stream_id),
+                StreamEvent::StreamCompleted(stream_id),
+            );
+        }
+
+        Ok(withdrawable)
+    }
+
+    /// Return the current delegated-withdraw nonce for a recipient.
+    ///
+    /// Relayers must include this value in the signed message to prevent replay attacks.
+    /// The nonce is incremented on every successful `delegated_withdraw` call.
+    pub fn get_delegated_nonce(env: Env, recipient: Address) -> u64 {
+        load_delegated_nonce(&env, &recipient)
     }
 
     /// Calculate the total amount accrued to the recipient at the current time.
