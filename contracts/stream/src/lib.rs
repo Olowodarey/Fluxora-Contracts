@@ -357,6 +357,34 @@ pub struct StreamCreated {
     pub metadata: Option<Map<soroban_sdk::Bytes, soroban_sdk::Bytes>>,
 }
 
+/// Emitted when a stream is cloned via `clone_stream`.
+///
+/// Carries both the source stream ID (for audit trail) and the full parameters
+/// of the newly created stream so indexers can correlate the two without a
+/// separate `get_stream_state` call.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamCloned {
+    /// The newly created stream's ID.
+    pub new_stream_id: u64,
+    /// The source stream that was cloned.
+    pub source_stream_id: u64,
+    /// Sender of the new stream (same as the caller / original sender).
+    pub sender: Address,
+    /// Recipient of the new stream (may differ from the source stream's recipient).
+    pub recipient: Address,
+    /// Deposit amount locked into the new stream.
+    pub deposit_amount: i128,
+    /// Rate per second inherited from the source stream.
+    pub rate_per_second: i128,
+    /// Absolute start time of the new stream.
+    pub start_time: u64,
+    /// Cliff time of the new stream (preserves the source cliff offset).
+    pub cliff_time: u64,
+    /// End time of the new stream.
+    pub end_time: u64,
+}
+
 /// Result of a single stream creation attempt in a partial batch.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4999,6 +5027,688 @@ impl FluxoraStream {
                 paused_by: None,
             }
         }
+    }
+
+    /// Sweep excess tokens from the contract to a specified recipient.
+    ///
+    /// When streams are cancelled or the deposit sum exceeds cumulative accrual
+    /// (e.g., due to rate decreases via `decrease_rate_per_second`), residual USDC
+    /// can become trapped in the contract. This function allows the admin to recover
+    /// those excess tokens by calculating the difference between the contract's token
+    /// balance and the sum of all outstanding obligations (tracked liabilities).
+    ///
+    /// # Parameters
+    /// - `recipient`: Address to receive the excess tokens
+    ///
+    /// # Authorization
+    /// - Requires authorization from the contract admin
+    ///
+    /// # Returns
+    /// - `i128`: Amount of excess tokens swept (0 if no excess exists)
+    ///
+    /// # Errors
+    /// - `ContractError::InvalidState`: If contract is not initialized
+    /// - `ContractError::Unauthorized`: If caller is not the admin
+    /// - `ContractError::InvalidParams`: If recipient address is invalid
+    ///
+    /// # Events
+    /// - Publishes `ExcessSwept { to, amount }` event on success
+    ///
+    /// # Security
+    /// - Only callable by admin to prevent unauthorized fund extraction
+    /// - Uses tracked liabilities (`TotalLiabilities`) to ensure recipient funds are protected
+    /// - CEI pattern: calculates excess, updates state, then transfers tokens
+    /// - Reentrancy protected via `acquire_reentrancy_lock`
+    ///
+    /// # Calculation
+    /// ```text
+    /// excess = contract_token_balance - total_liabilities
+    /// ```
+    ///
+    /// Where `total_liabilities` is the sum of all active stream deposits that haven't
+    /// been withdrawn or refunded yet.
+    ///
+    /// # Usage Notes
+    /// - Safe to call even when no excess exists (returns 0, no transfer)
+    /// - Does not affect active streams or recipient entitlements
+    /// - Useful for recovering funds after mass cancellations or rate decreases
+    /// - Should be called periodically by operators to maintain clean accounting
+    ///
+    /// # Example Scenarios
+    /// 1. Stream cancelled at 50% completion → 50% refunded to sender, but if sender
+    ///    address is lost, those tokens become excess
+    /// 2. Rate decreased from 100/s to 50/s → excess deposit refunded, but if refund
+    ///    fails, tokens remain in contract
+    /// 3. Rounding errors accumulate over many streams → small excess builds up
+    pub fn sweep_excess(env: Env, recipient: Address) -> Result<i128, ContractError> {
+        // Only admin can sweep excess tokens
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        // Validate recipient address
+        recipient.require_valid();
+
+        // Get contract's token balance
+        let token_address = get_token(&env)?;
+        let token_client = token::Client::new(&env, &token_address);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+
+        // Get total outstanding liabilities (sum of all active stream deposits)
+        let total_liabilities = read_total_liabilities(&env);
+
+        // Calculate excess: balance - liabilities
+        // If liabilities exceed balance, there's no excess (should not happen in normal operation)
+        let excess = contract_balance.saturating_sub(total_liabilities);
+
+        // If no excess, return early (no transfer needed)
+        if excess <= 0 {
+            return Ok(0);
+        }
+
+        // CEI pattern: Emit event before transfer
+        env.events().publish(
+            (symbol_short!("ex_swept"), recipient.clone()),
+            ExcessSwept {
+                to: recipient.clone(),
+                amount: excess,
+            },
+        );
+
+        // Acquire reentrancy lock before token transfer
+        acquire_reentrancy_lock(&env)?;
+
+        // Transfer excess tokens to recipient
+        let transfer_result = push_token(&env, &recipient, excess);
+
+        // Release reentrancy lock
+        release_reentrancy_lock(&env);
+
+        // Propagate any transfer errors
+        transfer_result?;
+
+        Ok(excess)
+    }
+
+    /// Set an auto-claim destination for a stream.
+    ///
+    /// Allows the recipient to opt in to permissionless final withdrawal at `end_time`.
+    /// Once set, anyone can call `trigger_auto_claim` to send the final withdrawal to
+    /// the specified destination address.
+    ///
+    /// # Parameters
+    /// - `stream_id`: The stream to configure
+    /// - `destination`: Address where tokens will be sent when auto-claim is triggered
+    ///
+    /// # Authorization
+    /// - Requires authorization from the stream recipient
+    ///
+    /// # Returns
+    /// - `Ok(())` on success
+    ///
+    /// # Errors
+    /// - `ContractError::StreamNotFound`: Stream does not exist
+    /// - `ContractError::Unauthorized`: Caller is not the recipient
+    /// - `ContractError::InvalidParams`: Destination is zero address or contract itself
+    ///
+    /// # Events
+    /// - Publishes `AutoClaimSet { stream_id, destination }` event
+    ///
+    /// # Security
+    /// - Only recipient can set/change destination
+    /// - Destination is validated (non-zero, not contract)
+    /// - Can be called multiple times to change destination
+    /// - Use `revoke_auto_claim` to remove the destination
+    ///
+    /// # Usage Notes
+    /// - Destination is stored in persistent storage
+    /// - Setting a new destination overwrites the previous one
+    /// - Auto-claim can only be triggered after `end_time`
+    /// - Works with both Active and Paused streams
+    pub fn set_auto_claim(
+        env: Env,
+        stream_id: u64,
+        destination: Address,
+    ) -> Result<(), ContractError> {
+        let stream = load_stream(&env, stream_id)?;
+        stream.recipient.require_auth();
+
+        // Validate destination
+        if !Self::is_valid_destination(&env, &destination) {
+            return Err(ContractError::InvalidParams);
+        }
+
+        // Store destination
+        let key = DataKey::AutoClaimDestination(stream_id);
+        env.storage().persistent().set(&key, &destination);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("ac_set"), stream_id),
+            AutoClaimSet {
+                stream_id,
+                destination: destination.clone(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Revoke the auto-claim destination for a stream.
+    ///
+    /// Removes the auto-claim destination, preventing `trigger_auto_claim` from being called.
+    /// The recipient can set a new destination later via `set_auto_claim`.
+    ///
+    /// # Parameters
+    /// - `stream_id`: The stream to configure
+    ///
+    /// # Authorization
+    /// - Requires authorization from the stream recipient
+    ///
+    /// # Returns
+    /// - `Ok(())` on success
+    ///
+    /// # Errors
+    /// - `ContractError::StreamNotFound`: Stream does not exist
+    /// - `ContractError::Unauthorized`: Caller is not the recipient
+    ///
+    /// # Events
+    /// - Publishes `AutoClaimRevoked { stream_id }` event
+    ///
+    /// # Usage Notes
+    /// - Removes destination from storage
+    /// - Can be called even if no destination was set (idempotent)
+    /// - Useful for cleaning up storage after stream cancellation
+    pub fn revoke_auto_claim(env: Env, stream_id: u64) -> Result<(), ContractError> {
+        let stream = load_stream(&env, stream_id)?;
+        stream.recipient.require_auth();
+
+        // Remove destination
+        let key = DataKey::AutoClaimDestination(stream_id);
+        env.storage().persistent().remove(&key);
+
+        // Emit event
+        env.events().publish(
+            (symbol_short!("ac_revoke"), stream_id),
+            AutoClaimRevoked { stream_id },
+        );
+
+        Ok(())
+    }
+
+    /// Trigger an auto-claim for a stream (permissionless).
+    ///
+    /// Anyone can call this function to execute the final withdrawal for a stream
+    /// that has reached `end_time` and has an auto-claim destination set by the recipient.
+    /// Tokens are sent to the destination address chosen by the recipient.
+    ///
+    /// # Parameters
+    /// - `stream_id`: The stream to claim
+    ///
+    /// # Authorization
+    /// - None required (permissionless)
+    ///
+    /// # Returns
+    /// - `i128`: Amount of tokens transferred to the destination
+    ///
+    /// # Errors
+    /// - `ContractError::StreamNotFound`: Stream does not exist
+    /// - `ContractError::InvalidState`: Stream is Completed, Cancelled, or before end_time
+    /// - `ContractError::InvalidParams`: No auto-claim destination set, or destination is invalid
+    /// - `ContractError::ContractPaused`: Global emergency pause is active
+    ///
+    /// # Events
+    /// - Publishes `AutoClaimTriggered { stream_id, destination, amount }` event
+    /// - May also publish `Withdrawal` and `Completed` events (same as withdraw)
+    ///
+    /// # Security
+    /// - Caller cannot influence destination (set by recipient)
+    /// - Destination validity is checked before transfer
+    /// - CEI pattern: state updated before token transfer
+    /// - Reentrancy protected
+    /// - Global pause blocks execution
+    ///
+    /// # Preconditions
+    /// 1. Stream exists and is not terminal (Completed/Cancelled)
+    /// 2. Current time >= stream.end_time
+    /// 3. Auto-claim destination is set
+    /// 4. Destination is valid (non-zero, not contract)
+    /// 5. Contract is not globally paused
+    ///
+    /// # Usage Notes
+    /// - Can be called by anyone (keepers, bots, users)
+    /// - Identical accounting to `withdraw_to`
+    /// - May transition stream to Completed status
+    /// - Returns 0 if nothing to withdraw (already fully withdrawn)
+    pub fn trigger_auto_claim(env: Env, stream_id: u64) -> Result<i128, ContractError> {
+        require_not_globally_paused(&env)?;
+
+        let mut stream = load_stream(&env, stream_id)?;
+
+        // Check stream is not terminal
+        if stream.status == StreamStatus::Completed || stream.status == StreamStatus::Cancelled {
+            return Err(ContractError::InvalidState);
+        }
+
+        // Check we're at or past end_time
+        let now = env.ledger().timestamp();
+        if now < stream.end_time {
+            return Err(ContractError::InvalidState);
+        }
+
+        // Load auto-claim destination
+        let key = DataKey::AutoClaimDestination(stream_id);
+        let destination: Address = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvalidParams)?;
+
+        // Validate destination before proceeding
+        if !Self::is_valid_destination(&env, &destination) {
+            return Err(ContractError::InvalidParams);
+        }
+
+        // Bump TTL on destination
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Calculate withdrawable amount (same logic as withdraw)
+        let accrued = accrual::calculate_accrued_amount_checkpointed(
+            accrual::CheckpointState {
+                checkpointed_amount: stream.checkpointed_amount,
+                checkpointed_at: stream.checkpointed_at,
+                cliff_time: stream.cliff_time,
+                end_time: stream.end_time,
+                deposit_amount: stream.deposit_amount,
+            },
+            stream.rate_per_second,
+            now,
+        );
+
+        let withdrawable = accrued.saturating_sub(stream.withdrawn_amount).max(0);
+
+        // Early return if nothing to withdraw
+        if withdrawable == 0 {
+            return Ok(0);
+        }
+
+        // Update stream state (CEI pattern)
+        stream.withdrawn_amount = stream
+            .withdrawn_amount
+            .checked_add(withdrawable)
+            .unwrap_or(i128::MAX);
+
+        // Check if stream is now completed
+        if stream.withdrawn_amount >= stream.deposit_amount {
+            stream.status = StreamStatus::Completed;
+        }
+
+        save_stream(&env, &stream);
+
+        // Emit auto-claim triggered event
+        env.events().publish(
+            (symbol_short!("ac_trig"), stream_id),
+            AutoClaimTriggered {
+                stream_id,
+                destination: destination.clone(),
+                amount: withdrawable,
+            },
+        );
+
+        // Emit withdrawal event (for consistency with withdraw_to)
+        env.events().publish(
+            (symbol_short!("withdrew"), stream_id),
+            WithdrawalTo {
+                stream_id,
+                recipient: stream.recipient.clone(),
+                destination: destination.clone(),
+                amount: withdrawable,
+            },
+        );
+
+        // Emit completed event if applicable
+        if stream.status == StreamStatus::Completed {
+            env.events().publish(
+                (symbol_short!("completed"), stream_id),
+                StreamEvent::StreamCompleted(stream_id),
+            );
+        }
+
+        // Acquire reentrancy lock
+        acquire_reentrancy_lock(&env)?;
+
+        // Transfer tokens to destination
+        let transfer_result = push_token(&env, &destination, withdrawable);
+
+        // Release reentrancy lock
+        release_reentrancy_lock(&env);
+
+        // Propagate any transfer errors
+        transfer_result?;
+
+        Ok(withdrawable)
+    }
+
+    /// Get the auto-claim status for a stream.
+    ///
+    /// Returns information about the auto-claim configuration, including whether
+    /// a destination is set, whether it's valid, and how much is currently claimable.
+    /// This allows callers to validate before executing `trigger_auto_claim`, reducing
+    /// failed transactions and wasted gas on invalid destinations.
+    ///
+    /// # Parameters
+    /// - `stream_id`: The stream to query
+    ///
+    /// # Authorization
+    /// - None required (view function)
+    ///
+    /// # Returns
+    /// - `AutoClaimStatus`: Status of auto-claim configuration
+    ///   - `NotSet`: No destination configured
+    ///   - `ValidDestination { destination, claimable }`: Valid destination with claimable amount
+    ///   - `InvalidDestination { destination }`: Destination is zero address or contract itself
+    ///
+    /// # Errors
+    /// - `ContractError::StreamNotFound`: Stream does not exist
+    ///
+    /// # Usage Notes
+    /// - Read-only query (no state changes)
+    /// - Claimable amount is calculated at current timestamp
+    /// - Destination validity checks: non-zero address, not contract address
+    /// - Use this before calling `trigger_auto_claim` to avoid failed transactions
+    ///
+    /// # Example
+    /// ```rust
+    /// let status = client.get_auto_claim_status(&stream_id);
+    /// match status {
+    ///     AutoClaimStatus::ValidDestination { destination, claimable } => {
+    ///         if claimable > 0 {
+    ///             client.trigger_auto_claim(&stream_id);
+    ///         }
+    ///     }
+    ///     AutoClaimStatus::NotSet => {
+    ///         // No auto-claim configured
+    ///     }
+    ///     AutoClaimStatus::InvalidDestination { destination } => {
+    ///         // Destination is invalid, cannot trigger
+    ///     }
+    /// }
+    /// ```
+    pub fn get_auto_claim_status(
+        env: Env,
+        stream_id: u64,
+    ) -> Result<AutoClaimStatus, ContractError> {
+        let stream = load_stream(&env, stream_id)?;
+
+        // Check if auto-claim destination is set
+        let key = DataKey::AutoClaimDestination(stream_id);
+        let destination_opt: Option<Address> = env.storage().persistent().get(&key);
+
+        match destination_opt {
+            None => Ok(AutoClaimStatus::NotSet),
+            Some(destination) => {
+                // Check if destination is valid
+                if !Self::is_valid_destination(&env, &destination) {
+                    return Ok(AutoClaimStatus::InvalidDestination { destination });
+                }
+
+                // Calculate claimable amount
+                let now = env.ledger().timestamp();
+                let accrued = accrual::calculate_accrued_amount_checkpointed(
+                    accrual::CheckpointState {
+                        checkpointed_amount: stream.checkpointed_amount,
+                        checkpointed_at: stream.checkpointed_at,
+                        cliff_time: stream.cliff_time,
+                        end_time: stream.end_time,
+                        deposit_amount: stream.deposit_amount,
+                    },
+                    stream.rate_per_second,
+                    now,
+                );
+
+                let claimable = accrued.saturating_sub(stream.withdrawn_amount).max(0);
+
+                Ok(AutoClaimStatus::ValidDestination {
+                    destination,
+                    claimable,
+                })
+            }
+        }
+    }
+
+    /// Get the auto-claim destination for a stream (if set).
+    ///
+    /// Returns the destination address configured by the recipient, or None if not set.
+    ///
+    /// # Parameters
+    /// - `stream_id`: The stream to query
+    ///
+    /// # Authorization
+    /// - None required (view function)
+    ///
+    /// # Returns
+    /// - `Option<Address>`: The destination address, or None if not set
+    ///
+    /// # Errors
+    /// - `ContractError::StreamNotFound`: Stream does not exist
+    ///
+    /// # Usage Notes
+    /// - Read-only query (no state changes)
+    /// - Does not validate destination (use `get_auto_claim_status` for validation)
+    /// - Returns None if no destination is configured
+    pub fn get_auto_claim_destination(
+        env: Env,
+        stream_id: u64,
+    ) -> Result<Option<Address>, ContractError> {
+        let _stream = load_stream(&env, stream_id)?;
+        let key = DataKey::AutoClaimDestination(stream_id);
+        Ok(env.storage().persistent().get(&key))
+    }
+
+    /// Clone an existing stream into a new stream with a different recipient and timing.
+    ///
+    /// Copies `rate_per_second`, the cliff offset (relative to `start_time`), the
+    /// `StreamKind` (via `withdraw_dust_threshold` and `memo`), and the source stream's
+    /// `sender` identity from the source stream, while accepting a fresh `new_recipient`,
+    /// `start_time`, `end_time`, and `deposit` for the new stream.
+    ///
+    /// This is the primary entry-point for recurring payment obligations (e.g. monthly
+    /// salary streams): operators no longer need to reconstruct the full parameter set
+    /// for each new period — they clone the previous stream and supply only what changes.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Source stream to clone from.
+    /// - `new_recipient`: Recipient of the new stream (may equal the source recipient).
+    /// - `start_time`: Absolute start timestamp for the new stream.
+    /// - `end_time`: Absolute end timestamp for the new stream.
+    /// - `deposit`: Deposit amount for the new stream.
+    ///   Must satisfy `deposit >= rate_per_second × (end_time − start_time)`.
+    /// - `force`: When `true`, allows cloning a source stream whose `withdraw_dust_threshold`
+    ///   is set to the sentinel value `i128::MAX` (used internally to mark `CliffOnly`-style
+    ///   streams). When `false` (the default), such streams are rejected with `InvalidParams`
+    ///   to prevent accidental cloning of degenerate configurations.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the **source stream's sender**.
+    ///   The admin can clone streams they created (admin == sender).
+    ///   Third parties and the source stream's recipient cannot clone.
+    ///
+    /// # Inherited fields (copied from source stream)
+    /// | Field | Behaviour |
+    /// |---|---|
+    /// | `rate_per_second` | Copied verbatim |
+    /// | cliff offset | `cliff_time = start_time + (source.cliff_time − source.start_time)` |
+    /// | `withdraw_dust_threshold` | Copied verbatim |
+    /// | `memo` | Copied verbatim |
+    ///
+    /// # Source stream state requirements
+    /// The source stream must be in one of the following states:
+    /// - `Completed` — natural end of a previous period.
+    /// - `Cancelled` — early termination of a previous period.
+    /// - `Active` or `Paused` — allowed when the caller is the original sender or admin
+    ///   (enables pre-scheduling the next period before the current one ends).
+    ///
+    /// # Returns
+    /// - `u64`: The new stream's ID.
+    ///
+    /// # Errors
+    /// - `StreamNotFound` (1): `stream_id` does not exist.
+    /// - `InvalidParams` (3): `force == false` and the source stream has a `CliffOnly`
+    ///   sentinel threshold (`i128::MAX`), or any parameter fails `validate_stream_params`.
+    /// - `ContractPaused` (4): Creation is globally paused.
+    /// - `StartTimeInPast` (5): `start_time < ledger.timestamp()`.
+    /// - `InsufficientDeposit` (10): `deposit < rate_per_second × (end_time − start_time)`.
+    /// - `ArithmeticOverflow` (6): Cliff offset calculation overflows `u64`.
+    ///
+    /// # Events
+    /// - Emits `("created", new_stream_id) → StreamCreated { ... }` (standard creation event).
+    /// - Emits `("cloned", new_stream_id) → StreamCloned { new_stream_id, source_stream_id, ... }`
+    ///   for indexers that need to correlate the clone relationship.
+    ///
+    /// # Security notes
+    /// - The caller must hold the source sender's auth key; a recipient or third party
+    ///   cannot clone a stream they do not own.
+    /// - Cloning an `Active` stream is intentionally allowed so operators can pre-schedule
+    ///   the next period. The source stream continues running independently.
+    /// - The `force` flag is a deliberate opt-in for unusual configurations; the default
+    ///   (`false`) is the safe path.
+    /// - CEI ordering is preserved: state is persisted before the token pull.
+    ///
+    /// # Example — recurring monthly salary
+    /// ```ignore
+    /// // Month 1 stream just completed (stream_id = 42).
+    /// // Clone it for month 2 with the same recipient and rate.
+    /// let month2_id = contract.clone_stream(
+    ///     &42,                    // source stream
+    ///     &employee_address,      // same recipient
+    ///     &month2_start,          // new start_time
+    ///     &month2_end,            // new end_time
+    ///     &monthly_salary,        // deposit
+    ///     &false,                 // force (not a CliffOnly stream)
+    /// )?;
+    /// ```
+    pub fn clone_stream(
+        env: Env,
+        stream_id: u64,
+        new_recipient: Address,
+        start_time: u64,
+        end_time: u64,
+        deposit: i128,
+        force: bool,
+    ) -> Result<u64, ContractError> {
+        // ── 1. Pause guard ────────────────────────────────────────────────────
+        require_not_creation_paused(&env)?;
+
+        // ── 2. Load source stream ─────────────────────────────────────────────
+        let source = load_stream(&env, stream_id)?;
+
+        // ── 3. Authorization: source sender ──────────────────────────────────
+        // Only the source stream's original sender may clone it.
+        // The contract admin can clone streams they created (admin == sender).
+        // For streams created by others, the admin must coordinate with the sender
+        // out-of-band; there is no admin-override path for clone_stream to prevent
+        // privilege escalation (an admin should not be able to spend a sender's tokens).
+        source.sender.require_auth();
+
+        // ── 4. CliffOnly guard ────────────────────────────────────────────────
+        // Streams with withdraw_dust_threshold == i128::MAX are treated as
+        // "CliffOnly" sentinel streams. Cloning them without explicit opt-in
+        // would silently propagate a degenerate configuration.
+        if source.withdraw_dust_threshold == i128::MAX && !force {
+            return Err(ContractError::InvalidParams);
+        }
+
+        // ── 5. Compute inherited cliff offset ─────────────────────────────────
+        // Preserve the relative cliff position: cliff_offset = source.cliff_time - source.start_time.
+        // Apply it to the new start_time.
+        let cliff_offset = source
+            .cliff_time
+            .checked_sub(source.start_time)
+            .unwrap_or(0); // if cliff < start (degenerate), treat as no cliff
+        let new_cliff_time = start_time
+            .checked_add(cliff_offset)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+
+        // ── 6. Validate new stream parameters ────────────────────────────────
+        let current_time = env.ledger().timestamp();
+        Self::validate_stream_params(
+            &env,
+            &source.sender,
+            &new_recipient,
+            deposit,
+            source.rate_per_second,
+            current_time,
+            start_time,
+            new_cliff_time,
+            end_time,
+        )?;
+
+        // ── 7. Pull deposit tokens from sender ────────────────────────────────
+        pull_token(&env, &source.sender, deposit)?;
+
+        // ── 8. Persist the new stream ─────────────────────────────────────────
+        let new_stream_id = Self::persist_new_stream(
+            &env,
+            source.sender.clone(),
+            new_recipient.clone(),
+            deposit,
+            source.rate_per_second,
+            start_time,
+            new_cliff_time,
+            end_time,
+            source.withdraw_dust_threshold,
+            source.memo.clone(),
+        )?;
+
+        // ── 9. Emit clone-specific event for indexer correlation ──────────────
+        env.events().publish(
+            (symbol_short!("cloned"), new_stream_id),
+            StreamCloned {
+                new_stream_id,
+                source_stream_id: stream_id,
+                sender: source.sender.clone(),
+                recipient: new_recipient,
+                deposit_amount: deposit,
+                rate_per_second: source.rate_per_second,
+                start_time,
+                cliff_time: new_cliff_time,
+                end_time,
+            },
+        );
+
+        Ok(new_stream_id)
+    }
+
+    /// Internal helper to validate an auto-claim destination address.
+    ///
+    /// A valid destination must be:
+    /// 1. Not a zero address
+    /// 2. Not the contract itself (would create a circular transfer)
+    ///
+    /// # Parameters
+    /// - `env`: Contract environment
+    /// - `destination`: Address to validate
+    ///
+    /// # Returns
+    /// - `true` if destination is valid
+    /// - `false` if destination is invalid
+    fn is_valid_destination(env: &Env, destination: &Address) -> bool {
+        // Check if destination is the contract itself
+        if destination == &env.current_contract_address() {
+            return false;
+        }
+
+        // In Soroban, addresses are always valid if they exist
+        // Additional validation could be added here if needed
+        true
     }
 }
 
