@@ -361,7 +361,42 @@ mod kani_proofs {
 
 #[cfg(test)]
 mod tests {
-    use super::calculate_accrued_amount;
+    use super::{assert_ledger_time_monotonic, calculate_accrued_amount};
+    use crate::ContractError;
+
+    // =========================================================================
+    // Tests for assert_ledger_time_monotonic
+    // =========================================================================
+
+    #[test]
+    fn ledger_time_monotonic_equal_times_ok() {
+        let result = assert_ledger_time_monotonic(1000, 1000);
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn ledger_time_monotonic_increasing_times_ok() {
+        let result = assert_ledger_time_monotonic(1000, 1001);
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn ledger_time_monotonic_zero_regression_error() {
+        let result = assert_ledger_time_monotonic(1000, 999);
+        assert_eq!(result, Err(ContractError::ClockRegression));
+    }
+
+    #[test]
+    fn ledger_time_monotonic_large_regression_error() {
+        let result = assert_ledger_time_monotonic(1000, 0);
+        assert_eq!(result, Err(ContractError::ClockRegression));
+    }
+
+    #[test]
+    fn ledger_time_monotonic_u64_max_times() {
+        let result = assert_ledger_time_monotonic(u64::MAX, u64::MAX);
+        assert_eq!(result, Ok(()));
+    }
 
     #[test]
     fn returns_zero_before_cliff() {
